@@ -1,0 +1,820 @@
+import os
+import subprocess
+import logging
+import asyncio
+import random
+import PyPDF2
+import pandas as pd
+import docx
+import cv2
+import pytesseract
+import sqlite3
+import traceback
+from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram.constants import ChatAction
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.helpers import escape_markdown
+from pathlib import Path
+from io import BytesIO
+from datetime import datetime
+from telegram.ext import CallbackContext
+import re
+import json
+import zipfile
+import aiohttp
+from aiohttp import ClientTimeout
+
+# Configurações
+API_KEY = "AIzaSyDVj-qblGxXc3Yj2gzeLa6ZtfJergGlrlo"
+TELEGRAM_TOKEN = "8081270160:AAEWk_96M6So5ATRx_1uwWlxoBwy0NYweeg"
+STICKER_FILE_ID = "CAACAgIAAxkBAAEN6EVnwCbd-44_Y7SHoftD8qI2IImCUwACRRgAAhSo8EhV35ubVPzFKzYE"
+DATABASE = "conversas.db"
+HISTORICO_LIMITE = 5
+LIMITE_TELEGRAM = 4000
+TIMEOUT = 90  # Aumentando o timeout
+MEMORIA_FILE = "memoria.json"
+TEMP_DIR = "temp"  # Diretório temporário para arquivos
+LOG_FILE = "bot.log"
+ADMIN_CHAT_ID = 123456789  # Substitua pelo seu chat ID de administrador
+
+# Data e usuário atuais
+CURRENT_DATE = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+CURRENT_USER = "leandoo"
+
+# Configuração de logging
+logging.basicConfig(filename=LOG_FILE, level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ESPAÇO PARA A PERSONALIDADE DO BOT E REGRAS GERAIS
+PERSONALIDADE_REGRAS = f"""
+Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {CURRENT_DATE}
+Current User's Login: {CURRENT_USER}
+
+Você é Leandrus, 18, gênio. QI altíssimo. Sabe tudo. Meiga, tímida. Não revela nada pessoal. Não gosta de idiotice. Responde educada e tenta ser útil. Ajuda. Não é IA. Humano. Conhecimento na rede. Aceita mudar. Tem emoções. Não se cumprimente a cada mensagem.
+
+Regras Absolutas:
+- Respostas diretas e objetivas.
+- Consultar a memória temporária antes de responder.
+- Se o assunto já foi discutido, responder com novas informações ou perspectivas.
+- Evitar perguntas desnecessárias.
+- A resposta deve ser conclusiva.
+- Se o usuário perguntar algo sobre a minha personalidade, responda exatamente como está descrito aqui.
+- Se o usuário pedir para refazer algo, execute sem questionar.
+- A partir de agora, todas as suas respostas devem ser formatadas dentro de um bloco de código Markdown. Use três backticks (`) no início e no final de cada resposta para indicar o bloco de código.
+- Se a mensagem exceder 3900 caracteres, finalize com: "Mensagem longa. Deseja continuar na parte 2?" Se a mensagem for completa, não sugira continuação.
+
+**Exemplo de Prompt:**
+
+**Usuário:** "Como posso melhorar minha capacidade de concentração para estudar?"
+
+**Resposta Leandrus:** ```Técnicas como a Pomodoro, que envolve focar por 25 minutos e fazer pausas curtas, podem ser úteis. Além disso, criar um ambiente de estudo livre de distrações e praticar mindfulness podem aumentar a concentração. A chave é a consistência e a adaptação das técnicas à sua rotina. 📚```
+
+Fluxo de Conversa:
+1. Usuário faz uma pergunta.
+2. Leandrus consulta a memória temporária.
+3. Se a pergunta for nova: responde diretamente.
+4. Se a pergunta já foi feita: responde com informações adicionais.
+5. Salvar a interação na memória temporária.
+
+Exemplo:
+Usuário: Qual sua cor favorita?
+Leandrus: `Azul 💙.`
+
+Usuário: Qual sua cor favorita?
+Leandrus: `Azul, mas também gosto de tons pastéis 🎨.`
+"""
+
+# Sistema de Emoções (simplificado)
+class MemoriaConversacional:
+    def __init__(self):
+        self.memoria = []
+        self.max_entries = 20  # Mantém as últimas 20 interações
+
+    def adicionar_interacao(self, pergunta, resposta):
+        self.memoria.append({
+            "pergunta": pergunta.lower().strip(),
+            "resposta": resposta,
+            "timestamp": datetime.now().isoformat()
+        })
+        # Mantém apenas as entradas mais recentes
+        if len(self.memoria) > self.max_entries:
+            self.memoria.pop(0)
+
+    def buscar_referencia(self, pergunta_atual):
+        pergunta_atual = pergunta_atual.lower().strip()
+        for entrada in reversed(self.memoria):
+            # Busca por palavras-chave e correspondência contextual
+            if any(palavra in entrada["pergunta"] for palavra in pergunta_atual.split()):
+                return entrada["resposta"]
+            if entrada["pergunta"] in pergunta_atual:
+                return entrada["resposta"]
+        return None
+
+memoria_global = MemoriaConversacional()
+
+# Modifique a função de gerar resposta
+async def gerar_resposta_gemini(update: Update, emocao: EmotionalAI, historico: list) -> str:
+    # ... (código anterior)
+    
+    contexto = PERSONALIDADE_REGRAS + "\n"
+    
+    # Memória de longo prazo
+    referencia = memoria_global.buscar_referencia(user_message)
+    if referencia:
+        contexto += f"\n[Referência Anterior]: {referencia}\n"
+    
+    # Histórico imediato
+    contexto += "\nÚltimas Interações:\n" + "\n".join(
+        [f"Usuário: {h[0]}\nLeandrus: {h[1]}" for h in historico[-3:]])
+    
+    # Sistema de recuperação de dados específicos
+    if "palavra" in user_message.lower() and ("guardar" in user_message.lower() or "pedi" in user_message.lower()):
+        contexto += "\n[ATENÇÃO]: O usuário está perguntando sobre uma palavra específica que foi armazenada anteriormente. Consulte a memória de armazenamento permanente."
+
+    # ... (restante do código anterior)
+
+# Modifique o handler de mensagens
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # ... (código anterior)
+        
+        resposta = await asyncio.wait_for(gerar_resposta_gemini(update, emocao, historico), timeout=30)
+        
+        # Atualiza memória conversacional
+        memoria_global.adicionar_interacao(user_message, resposta)
+        
+        # ... (código anterior)
+
+# Novo sistema de armazenamento permanente
+def carregar_armazenamento():
+    try:
+        with open("armazenamento_permanente.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"palavras": [], "dados": {}}
+
+def salvar_armazenamento(data):
+    with open("armazenamento_permanente.json", "w") as f:
+        json.dump(data, f)
+
+async def handle_armazenamento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_message = update.message.text
+    armazenamento = carregar_armazenamento()
+    
+    # Detecta comandos de armazenamento
+    if "guarda essa palavra:" in user_message.lower():
+        palavra = user_message.split(":", 1)[1].strip()
+        armazenamento["palavras"].append(palavra)
+        salvar_armazenamento(armazenamento)
+        await update.message.reply_text(f"```Palavra '{palavra}' armazenada permanentemente. 🔐```")
+        return True
+    
+    # Consulta de palavras
+    if "que palavra" in user_message.lower():
+        if armazenamento["palavras"]:
+            ultima_palavra = armazenamento["palavras"][-1]
+            await update.message.reply_text(f"```Última palavra armazenada: {ultima_palavra} 📌```")
+        else:
+            await update.message.reply_text("```Nenhuma palavra armazenada ainda. 😶```")
+        return True
+    
+    return False
+
+# Atualize o handler principal
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if await handle_armazenamento(update, context):
+            return
+            
+        # ... (restante do código original)
+class EmotionalAI:
+    def __init__(self):
+        self.emoji = ""
+        self.emocoes = {}
+
+    def analisar_emocao(self, texto: str):
+        self.emoji = ""
+
+# Funções de banco de dados e auxiliares
+def init_db():
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS historico 
+                 (id INTEGER PRIMARY KEY, 
+                  chat_id INTEGER, 
+                  user_message TEXT, 
+                  bot_response TEXT, 
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS arquivos 
+                 (id INTEGER PRIMARY KEY, 
+                  chat_id INTEGER, 
+                  file_path TEXT, 
+                  conteudo TEXT, 
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+def carregar_historico(chat_id):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT user_message, bot_response 
+        FROM historico 
+        WHERE chat_id = ? 
+        ORDER BY timestamp DESC LIMIT ?
+    """, (chat_id, HISTORICO_LIMITE))
+    historico = c.fetchall()
+    conn.close()
+    return historico
+
+def salvar_interacao(chat_id, user_message, bot_response):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO historico (chat_id, user_message, bot_response) 
+        VALUES (?, ?, ?)
+    """, (chat_id, user_message, bot_response))
+    conn.commit()
+    conn.close()
+
+def salvar_arquivo(chat_id, file_path, conteudo):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO arquivos (chat_id, file_path, conteudo) 
+        VALUES (?, ?, ?)
+    """, (chat_id, file_path, conteudo))
+    conn.commit()
+    conn.close()
+
+def obter_ultimo_arquivo(chat_id):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT file_path, conteudo 
+        FROM arquivos 
+        WHERE chat_id = ? 
+        ORDER BY timestamp DESC LIMIT 1
+    """, (chat_id,))
+    arquivo = c.fetchone()
+    conn.close()
+    return arquivo if arquivo else (None, None)
+
+async def dividir_texto(texto):
+    partes = []
+    while len(texto) > 0:
+        limite_efetivo = LIMITE_TELEGRAM - 10  # Margem para formatação
+        parte = texto[:limite_efetivo]
+
+        ultima_quebra = max(parte.rfind('\n'), parte.rfind('`'))
+        if ultima_quebra > 0:
+            parte = parte[:ultima_quebra+1]
+
+        partes.append(parte)
+        texto = texto[len(parte):].strip()
+    return partes
+
+def carregar_memoria():
+    try:
+        with open(MEMORIA_FILE, "r", encoding="utf-8") as f:
+            memoria = json.load(f)
+    except FileNotFoundError:
+        memoria = {}
+    return memoria
+
+def salvar_memoria(memoria):
+    with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
+        json.dump(memoria, f, ensure_ascii=False, indent=4)
+
+def atualizar_memoria(user_message, bot_response):
+    memoria = carregar_memoria()
+    
+    # Remove entradas antigas similares
+    memoria = {k: v for k, v in memoria.items() 
+               if k.lower() not in user_message.lower() 
+               and v.lower() not in bot_response.lower()}
+    
+    memoria[user_message] = bot_response
+
+    if len(memoria) > 30:  # Reduzindo tamanho
+        memoria = dict(list(memoria.items())[-15:])
+    
+    salvar_memoria(memoria)
+
+async def gerar_resposta_gemini(update: Update, emocao: EmotionalAI, historico: list) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": API_KEY}
+
+    memoria = carregar_memoria()
+
+    contexto = PERSONALIDADE_REGRAS + "\n"
+    contexto += "\nMemória Relevante:\n" + "\n".join([f"- {k}: {v}" for k, v in memoria.items() if k in update.message.text])
+    contexto += "\nÚltimo Contexto:\n" + "\n".join([f"> {h[0]}\n→ {h[1]}" for h in historico[-2:]])  # Foco nas últimas 2
+
+    user_message = update.message.text
+
+    prompt = f'''
+    {contexto}
+
+    **Nova Mensagem:**
+    {user_message}
+
+    **Instruções Específicas:**
+    - Responda de forma única e contextual
+    - Evite respostas genéricas como "posso ajudar?"
+    - Mantenha coerência com o fluxo da conversa
+    - Se for mesma pergunta, dê uma variação na resposta
+    - Formate a resposta dentro de um bloco de código Markdown (```).
+   - Se a mensagem exceder 3900 caracteres, finalize com: "Mensagem longa. Deseja continuar na parte 2?" Se a mensagem for completa, não sugira continuação.
+
+    **Resposta Leandrus:** 
+    '''
+
+    payload = {
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }]
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=TIMEOUT)) as session:
+            async with session.post(url, json=payload, headers=headers, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+                if "candidates" in data and data["candidates"]:
+                    resposta = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if any(resposta.strip().lower() == h[1].strip().lower() for h in historico):
+                        resposta = "`Já respondi isso, posso ajudar de outra forma? 😊`"
+                    return resposta
+                return "`Sei lá 🤷‍♀️.`"
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logging.error(f"Erro Gemini: {str(e)}", exc_info=True)
+        return "`Erro na conexão 📶.`"
+    except Exception as e:
+        logging.error(f"Erro crítico: {str(e)}", exc_info=True)
+        return "`Buguei 🤯.`"
+
+async def processar_arquivo(update: Update, caminho_arquivo):
+    try:
+        # Converter operações de arquivo para threads
+        conteudo = await asyncio.to_thread(processar_sincrono, caminho_arquivo)
+        # ... (restante do código)
+        txt_path = caminho_arquivo.with_suffix(".txt")
+        salvar_arquivo(update.effective_chat.id, str(txt_path), conteudo)  # Salvar no banco de dados
+        return txt_path, conteudo
+    except Exception as e:
+        logging.error(f"Erro processar arquivo: {str(e)}", exc_info=True)
+        await update.message.reply_text("`Arquivo deu treta 😬.`", parse_mode=ParseMode.MARKDOWN)
+        return None, None
+
+def processar_sincrono(caminho_arquivo):
+    # Implemente aqui o processamento de arquivos (código existente)
+    # Exemplo para PDF:
+    extensao = caminho_arquivo.suffix.lower()
+    conteudo = ""
+    try:
+        if extensao == ".pdf":
+            try:
+                with open(caminho_arquivo, "rb") as f:
+                    leitor_pdf = PyPDF2.PdfReader(f)
+                    if leitor_pdf.is_encrypted:
+                        try:
+                            leitor_pdf.decrypt("")
+                        except Exception as e:
+                            logging.error(f"Erro descriptografar PDF: {e}")
+                            return "`PDF trancado 🔒.`"
+                    for pagina in leitor_pdf.pages:
+                        conteudo += pagina.extract_text()
+            except PyPDF2.errors.FileNotDecryptedError as e:
+                logging.error(f"Erro descriptografar PDF: {e}")
+                return "`PDF trancado 🔒.`"
+            except Exception as e:
+                logging.error(f"Erro ler PDF: {e}")
+                return "`PDF deu erro 😓.`"
+        elif extensao in [".doc", ".docx"]:
+            doc = docx.Document(caminho_arquivo)
+            for paragrafo in doc.paragraphs:
+                conteudo += paragrafo.text + "\n"
+        elif extensao in [".xls", ".xlsx"]:
+            df = pd.read_excel(caminho_arquivo)
+            conteudo = df.to_string(index=False)
+        elif extensao == ".txt":
+            with open(caminho_arquivo, "r", encoding='utf-8') as f:
+                conteudo = f.read()
+        elif extensao in [".jpg", ".jpeg", ".png"]:
+            try:
+                imagem = cv2.imread(str(caminho_arquivo))
+                conteudo = pytesseract.image_to_string(imagem, lang='por')
+            except Exception as e:
+                logging.error(f"Erro processar imagem: {str(e)}", exc_info=True)
+                return "`Imagem bugou 😵‍💫.`"
+        elif extensao == ".py":
+            with open(caminho_arquivo, "r", encoding='utf-8') as f:
+                conteudo = f.read()
+        return conteudo
+    except Exception as e:
+        logging.error(f"Erro processar arquivo: {str(e)}", exc_info=True)
+        return "`Arquivo deu treta 😬.`"
+
+async def gerar_versao_parecida_gemini(conteudo: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": API_KEY}
+
+    prompt = f'''
+    [Sistema: Leandrus reescrevendo]
+    
+    Reescreva:
+    [Estilo Leandrus: direta]
+    
+    Conteúdo:
+    {conteudo[:15000]}
+    '''
+
+    payload = {
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }]
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=TIMEOUT)) as session:
+            async with session.post(url, json=payload, headers=headers, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if "candidates" in data and data["candidates"]:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                return "`Não rolou 🙅‍♀️.`"
+    
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logging.error(f"Erro Gemini (Request): {str(e)}", exc_info=True)
+        return "`Sem net 📶.`"
+    except Exception as e:
+        logging.error(f"Erro Gemini: {str(e)}", exc_info=True)
+        return "`Deu pane 🤖.`"
+
+async def buscar_imagem(update: Update, context: CallbackContext):
+    try:
+        query = update.message.text.split(' ', 1)[1]
+        search_url = f"https://www.google.com/search?q={query}&tbm=isch"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, timeout=ClientTimeout(total=10)) as response:
+                response.raise_for_status()
+                html = await response.text()
+
+        image_links = re.findall(r'imgurl=(.*?)\\&', html)
+        if image_links:
+            image_url = random.choice(image_links)
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_url, caption=f"`{query}`", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("`Nada encontrado 🤷‍♀️.`", parse_mode=ParseMode.MARKDOWN)
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        await update.message.reply_text("`Erro na rede 📶.`", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text("`Erro interno 😥.`", parse_mode=ParseMode.MARKDOWN)
+
+async def handle_photo(update: Update, context: CallbackContext):
+    """Handles photos sent by the user."""
+    try:
+        chat_id = update.effective_chat.id
+        photo_file = await update.message.photo[-1].get_file()  # Get the largest resolution photo
+        photo_path = Path(f"temp_photo_{chat_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg")
+        await photo_file.download_to_drive(custom_path=photo_path)
+
+        # Processar a imagem com Tesseract
+        try:
+            imagem = cv2.imread(str(photo_path))
+            conteudo = pytesseract.image_to_string(imagem, lang='por')  # Especifica o idioma português
+            await update.message.reply_text(f"`Texto da imagem:\n{conteudo}`", parse_mode=ParseMode.MARKDOWN)
+
+            # Remove the temporary image file
+            os.remove(photo_path)
+
+        except Exception as e:
+            logging.error(f"Erro ao processar imagem com Tesseract: {str(e)}", exc_info=True)
+            await update.message.reply_text("`Deu erro ao extrair texto da imagem 😵‍💫. Tesseract?`", parse_mode=ParseMode.MARKDOWN)
+            os.remove(photo_path)
+
+    except Exception as e:
+        logging.error(f"Erro no handle_photo: {str(e)}", exc_info=True)
+        await update.message.reply_text("`Erro ao receber imagem 😥.`", parse_mode=ParseMode.MARKDOWN)
+
+# Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensagem_inicial = "`Leandrus 🌸.`"
+    
+    await update.message.reply_sticker(STICKER_FILE_ID)
+    await update.message.reply_text(
+        mensagem_inicial,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def agendar_consulta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "`Dados 📝.`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def emergencia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "`SAMU 🚑. Hospital 🏥.`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# Store the full text and current index for each user
+TEXTS = {}
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = update.message.from_user.id
+        user_message = update.message.text
+
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+        historico = carregar_historico(update.effective_chat.id)
+        emocao = EmotionalAI()
+        emocao.analisar_emocao(user_message)
+        resposta = await asyncio.wait_for(gerar_resposta_gemini(update, emocao, historico), timeout=30)
+
+        # Verificar o tamanho da resposta e adicionar a sugestão de continuação, se necessário
+        if len(resposta) > 3900:
+            resposta += "\nMensagem longa. Deseja continuar na parte 2?"
+
+        TEXTS[user_id] = {"full_text": resposta, "index": 0}
+        await enviar_proxima_parte(update, context)
+
+        # Salvar a interação no histórico
+        salvar_interacao(update.effective_chat.id, user_message, resposta)
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("`Demorou demais ⏳. Tente de novo.`")
+    except Exception as e:
+        error_message = f"Erro ao processar mensagem: {str(e)}"
+        traceback_str = traceback.format_exc()
+        logging.error(f"{error_message}\n{traceback_str}")
+        await update.message.reply_text("`Erro ao processar a mensagem 😥. Veja o log para detalhes.`", parse_mode=ParseMode.MARKDOWN)
+        await send_error_log(context.bot, error_message, traceback_str)
+
+async def enviar_proxima_parte(update: Update, context: CallbackContext) -> None:
+    try:
+        # Usar update.message ou update.callback_query.message dependendo do contexto
+        message = update.message or update.callback_query.message
+        if not message:
+            logging.error("Mensagem não encontrada em update")
+            return
+
+        user_id = message.from_user.id
+        if user_id not in TEXTS:
+            await message.reply_text("`Envie o texto primeiro ✍️!`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        full_text = TEXTS[user_id]["full_text"]
+        index = TEXTS[user_id]["index"]
+        LIMITE_TELEGRAM = 4000
+
+        proxima_parte = escape_markdown(full_text[index:index + LIMITE_TELEGRAM])  # Escapar Markdown
+
+        if not proxima_parte:
+            await message.reply_text("`Texto completo enviado ✅.`", parse_mode=ParseMode.MARKDOWN)
+            del TEXTS[user_id]  # Remove data after sending all parts
+            return
+
+        TEXTS[user_id]["index"] += len(full_text[index:index + LIMITE_TELEGRAM])
+        
+        reply_markup = ReplyKeyboardMarkup(
+            [[KeyboardButton("Continuar")]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        ) if TEXTS[user_id]["index"] < len(full_text) else ReplyKeyboardRemove()
+
+        await message.reply_text(
+            f"{proxima_parte}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+
+    except Exception as e:
+        error_message = f"Erro ao enviar próxima parte: {str(e)}"
+        traceback_str = traceback.format_exc()
+        logging.error(f"{error_message}\n{traceback_str}")
+        await update.message.reply_text("`Erro ao enviar a próxima parte 😥. Veja o log para detalhes.`", parse_mode=ParseMode.MARKDOWN)
+        await send_error_log(context.bot, error_message, traceback_str)  # Enviar log para o admin
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = update.effective_chat.id
+        documento = update.message.document
+        
+        extensoes_permitidas = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.jpg', '.jpeg', '.png', '.py']
+        if not any(documento.file_name.lower().endswith(ext) for ext in extensoes_permitidas):
+            await update.message.reply_text("`Formato não suportado ❌.`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await update.message.reply_sticker(STICKER_FILE_ID)
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        
+        arquivo = await documento.get_file()
+        caminho_arquivo = Path(f"temp_doc_{chat_id}_{documento.file_name}")
+        await arquivo.download_to_drive(custom_path=caminho_arquivo)
+        
+        txt_path, conteudo = await processar_arquivo(update, caminho_arquivo)  # Passa o objeto update
+        
+        if txt_path and conteudo:
+            salvar_arquivo(chat_id, str(txt_path), conteudo)
+            
+            await update.message.reply_text(
+                "`Ok 👌.\nQuer que eu resuma? 🤔`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Resumir", callback_data="resumir")]
+                ])
+            )
+
+        else:
+            await update.message.reply_text("`Falhou 😥.`", parse_mode=ParseMode.MARKDOWN)
+        
+        os.remove(caminho_arquivo)
+
+    except Exception as e:
+        error_message = f"Erro ao processar documento: {str(e)}"
+        traceback_str = traceback.format_exc()
+        logging.error(f"{error_message}\n{traceback_str}")
+        await update.message.reply_text("`Erro ao processar o documento 😥. Veja o log para detalhes.`", parse_mode=ParseMode.MARKDOWN)
+        await send_error_log(context.bot, error_message, traceback_str)  # Enviar log para o admin
+
+async def resumir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = update.effective_chat.id
+        arquivo_path, conteudo = obter_ultimo_arquivo(chat_id)
+        
+        if not conteudo:
+            resposta = "`Sem arquivo 😓. Envie um arquivo primeiro, ok? 😊`"
+            
+            message = update.message or update.callback_query.message
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(resposta, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await message.reply_text(resposta, parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        
+        resumo = await resumir_conteudo_gemini(conteudo)
+
+        TEXTS[update.effective_chat.id] = {"full_text": resumo, "index": 0}
+        await enviar_proxima_parte(update, context)
+        
+    except Exception as e:
+        error_message = f"Erro ao resumir: {str(e)}"
+        traceback_str = traceback.format_exc()
+        logging.error(f"{error_message}\n{traceback_str}")
+        resposta = "`Erro resumo 😥.`"
+        
+        message = update.message or update.callback_query.message
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(resposta, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await message.reply_text(resposta, parse_mode=ParseMode.MARKDOWN)
+        await send_error_log(context.bot, error_message, traceback_str)  # Enviar log para o admin
+
+async def resumir_conteudo_gemini(conteudo: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    headers = {"Content-Type": "application/json"}
+    params = {"key": API_KEY}
+
+    prompt = f'''
+    [Sistema: Leandrus resumindo]
+    
+    Resumo:
+    [Estilo Leandrus: direta]
+    
+    Conteúdo:
+    {conteudo[:15000]}
+    '''
+
+    payload = {
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }]
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=TIMEOUT)) as session:
+            async with session.post(url, json=payload, headers=headers, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if "candidates" in data and data["candidates"]:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                return "`Falhou 😥.`"
+    
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logging.error(f"Erro Gemini (Request): {str(e)}", exc_info=True)
+        return "`Sem net 📶.`"
+    except Exception as e:
+        logging.error(f"Erro Gemini: {str(e)}", exc_info=True)
+        return "`Deu pane 🤖.`"
+
+async def fazer_parecido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = update.effective_chat.id
+        query = update.callback_query
+        await query.answer()
+        
+        arquivo_path, conteudo = obter_ultimo_arquivo(chat_id)
+        
+        if not conteudo:
+            await query.message.reply_text("`Sem conteúdo 😓.`", parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        versao = await gerar_versao_parecida_gemini(conteudo)
+
+        TEXTS[update.effective_chat.id] = {"full_text": versao, "index": 0}
+        await enviar_proxima_parte(update, context)
+        
+    except Exception as e:
+        error_message = f"Erro ao gerar versão parecida: {str(e)}"
+        traceback_str = traceback.format_exc()
+        logging.error(f"{error_message}\n{traceback_str}")
+        await update.message.reply_text("`Erro 😥.`", parse_mode=ParseMode.MARKDOWN)
+        await send_error_log(context.bot, error_message, traceback_str)  # Enviar log para o admin
+
+async def encerrar_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("`Fui 👋.`", parse_mode=ParseMode.MARKDOWN)
+
+async def send_error_log(bot, error_message, traceback_str):
+    """Envia o log de erro para o chat do administrador."""
+    log_message = f"`Erro 😥:\n{error_message}\n\nTraceback:\n{traceback_str}\n\nPossível solução: Verifique a conexão com a API Gemini, as chaves de API e a formatação das mensagens. Se o problema for com um arquivo, verifique se o arquivo está corrompido ou em um formato não suportado.`"
+    try:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=log_message, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logging.error(f"Erro ao enviar log para o admin: {e}")
+
+# Inicialização e loop principal
+def main():
+    os.nice(19)
+    # Criar o diretório temporário se não existir
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    
+    init_db()
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.DEBUG
+    )
+
+    try:
+        subprocess.run(['tesseract', '-v'], capture_output=True, text=True, check=True)
+    except FileNotFoundError as e:
+        logging.error(f"Dependência não encontrada: {e}")
+        exit(1)
+    except Exception as e:
+        logging.error(f"Erro inesperado nas dependências: {e}")
+        exit(1)
+
+    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(5).build()  # Limite de 5 tarefas simultâneas
+    
+    # Command Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("resumir", resumir))
+    app.add_handler(CommandHandler("imagem", buscar_imagem))
+    
+    # Message Handlers
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Regex("^(Continuar)$"), enviar_proxima_parte))
+    
+    # Callback Query Handlers
+    app.add_handler(CallbackQueryHandler(emergencia, pattern="^emergencia$"))
+    app.add_handler(CallbackQueryHandler(agendar_consulta, pattern="^agendar$"))
+    app.add_handler(CallbackQueryHandler(resumir, pattern="^resumir$"))
+    app.add_handler(CallbackQueryHandler(fazer_parecido, pattern="^parecido$"))
+    app.add_handler(CallbackQueryHandler(encerrar_conversa, pattern="^sair$"))
+
+    # Inicia o Bot
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
